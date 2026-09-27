@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ============================================================
+# OpenCode Manager
+# - One command to run OpenCode through a managed Linux worker.
+# - Keeps OpenCode binary cached locally.
+# - Keeps session/history storage shared.
+# - Keeps auth/config/cache/state isolated per worker.
+# - Can rotate the managed Linux worker on configured quota/auth errors.
+# - Does NOT invent or bypass provider credentials. Rotation only works
+#   with credentials/accounts you are authorized to use.
+# ============================================================
+
+VERSION="1.2.1"
+
+CONFIG_FILE="${OPENCODE_MANAGER_CONFIG:-/etc/opencode-manager/config.env}"
+STATE_DIR="${STATE_DIR:-/opt/opencode-manager/state}"
+LOG_DIR="${LOG_DIR:-/opt/opencode-manager/logs}"
+CACHE_DIR="${CACHE_DIR:-/opt/opencode-manager/bin}"
+SHARED_DIR="${SHARED_DIR:-/opt/opencode-manager/shared}"
+LOCK_FILE="${LOCK_FILE:-/run/lock/opencode-manager.lock}"
+
+# Defaults; may be overridden by CONFIG_FILE.
+SOURCE_USER="${SOURCE_USER:-abdotaher}"
+PROJECT_DIR="${PROJECT_DIR:-}"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/opencode-manager}"
+LEGACY_LAUNCHER="${LEGACY_LAUNCHER:-/usr/local/bin/opencode-user}"
+MANAGED_PREFIX="${MANAGED_PREFIX:-opencode}"
+SHARED_GROUP="${SHARED_GROUP:-opencode-shared}"
+SOURCE_BIN="${SOURCE_BIN:-/home/${SOURCE_USER}/.opencode/bin/opencode}"
+CACHE_BIN="${CACHE_BIN:-${CACHE_DIR}/opencode}"
+
+# Manager behavior.
+AUTO_ROTATE="${AUTO_ROTATE:-1}"
+MAX_ROTATIONS_PER_RUN="${MAX_ROTATIONS_PER_RUN:-20}"
+TEMP_RATE_LIMIT_SLEEP="${TEMP_RATE_LIMIT_SLEEP:-30}"
+NETWORK_RETRY_SLEEP="${NETWORK_RETRY_SLEEP:-10}"
+MAX_NETWORK_RETRIES="${MAX_NETWORK_RETRIES:-5}"
+
+# Set this only if your installed OpenCode version supports a resume command.
+# Example: OPENCODE_RESUME_ARGS="--continue"
+OPENCODE_RESUME_ARGS="${OPENCODE_RESUME_ARGS:-}"
+
+CURRENT_USER_FILE="${STATE_DIR}/current-user"
+SEQUENCE_FILE="${STATE_DIR}/sequence"
+HISTORY_DIR="${STATE_DIR}/history"
+MANAGER_LOG="${LOG_DIR}/manager.log"
+
+mkdir_safe() {
+  mkdir -p "$1"
+}
+
+log() {
+  local message="$*"
+  # Logs belong on stderr so helper functions can safely return values on stdout.
+  # Example: username="$(get_or_create_worker)" must capture only the username.
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" | tee -a "$MANAGER_LOG" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Run with sudo/root."
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+
+  SOURCE_BIN="${SOURCE_BIN:-/home/${SOURCE_USER}/.opencode/bin/opencode}"
+  CACHE_BIN="${CACHE_BIN:-${CACHE_DIR}/opencode}"
+}
+
+init_dirs() {
+  mkdir_safe "$STATE_DIR"
+  mkdir_safe "$LOG_DIR"
+  mkdir_safe "$CACHE_DIR"
+  mkdir_safe "$SHARED_DIR"
+  mkdir_safe "$HISTORY_DIR"
+
+  touch "$MANAGER_LOG"
+  chmod 750 "$STATE_DIR" "$CACHE_DIR" "$SHARED_DIR" "$HISTORY_DIR" 2>/dev/null || true
+  # Workers need execute permission on the log directory so util-linux `script`
+  # can open the pre-created per-worker log file. They still cannot list it.
+  chmod 751 "$LOG_DIR" 2>/dev/null || true
+  chmod 640 "$MANAGER_LOG" 2>/dev/null || true
+}
+
+acquire_lock() {
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another OpenCode Manager operation is already running."
+}
+
+validate_config() {
+  getent passwd "$SOURCE_USER" >/dev/null || die "Source user does not exist: $SOURCE_USER"
+  [[ -n "$MANAGED_PREFIX" ]] || die "MANAGED_PREFIX cannot be empty."
+  [[ "$MANAGED_PREFIX" != "$SOURCE_USER" ]] || die "Managed prefix cannot equal SOURCE_USER."
+}
+
+resolve_project_dir() {
+  # sudo preserves the caller's working directory. Resolve it canonically so
+  # OpenCode session directory matching is exact and stable.
+  PROJECT_DIR="${OPENCODE_PROJECT_DIR:-$(pwd -P)}"
+  [[ -d "$PROJECT_DIR" ]] || die "Current project directory does not exist: $PROJECT_DIR"
+  [[ "$PROJECT_DIR" == /home/* || "$PROJECT_DIR" == /srv/* || "$PROJECT_DIR" == /opt/* ]] ||     die "Refusing unexpected project path: $PROJECT_DIR"
+}
+
+ensure_group() {
+  if ! getent group "$SHARED_GROUP" >/dev/null; then
+    groupadd "$SHARED_GROUP"
+  fi
+  usermod -aG "$SHARED_GROUP" "$SOURCE_USER"
+}
+
+ensure_cached_binary() {
+  mkdir -p "$CACHE_DIR"
+
+  if [[ ! -x "$CACHE_BIN" ]]; then
+    [[ -x "$SOURCE_BIN" ]] || die "OpenCode source binary not found: $SOURCE_BIN"
+    install -m 755 -o root -g root "$SOURCE_BIN" "$CACHE_BIN"
+    log "Cached OpenCode binary at $CACHE_BIN"
+  fi
+
+  "$CACHE_BIN" --version >/dev/null || die "Cached OpenCode binary cannot run."
+}
+
+source_data_dir() {
+  printf '/home/%s/.local/share/opencode' "$SOURCE_USER"
+}
+
+managed_home() {
+  printf '/home/%s' "$1"
+}
+
+managed_data_dir() {
+  printf '/home/%s/.local/share/opencode' "$1"
+}
+
+share_one_item() {
+  local source_data="$1"
+  local name="$2"
+  local source_path="${source_data}/${name}"
+  local shared_path="${SHARED_DIR}/${name}"
+
+  if [[ -L "$source_path" ]]; then
+    local resolved=""
+    resolved="$(readlink -f "$source_path" 2>/dev/null || true)"
+    if [[ "$resolved" == "$shared_path" ]]; then
+      return 0
+    fi
+  fi
+
+  if [[ -e "$source_path" && ! -e "$shared_path" ]]; then
+    mv "$source_path" "$shared_path"
+  elif [[ -e "$source_path" && -e "$shared_path" ]]; then
+    local backup="${source_path}.pre-shared.$(date +%Y%m%d%H%M%S)"
+    mv "$source_path" "$backup"
+    log "Preserved source conflict as $backup"
+  fi
+
+  case "$name" in
+    project|storage)
+      mkdir -p "$shared_path"
+      ;;
+    opencode.db)
+      ;;
+  esac
+
+  rm -rf "$source_path"
+  ln -s "$shared_path" "$source_path"
+  chown -h "$SOURCE_USER:$(id -gn "$SOURCE_USER")" "$source_path"
+}
+
+ensure_shared_storage() {
+  local source_data
+  source_data="$(source_data_dir)"
+
+  mkdir -p "$source_data" "$SHARED_DIR"
+  chown "$SOURCE_USER:$(id -gn "$SOURCE_USER")" "$source_data"
+  chown root:"$SHARED_GROUP" "$SHARED_DIR"
+  chmod 2770 "$SHARED_DIR"
+
+  # Stop source-user OpenCode writers before migrating/linking shared state.
+  pkill -u "$SOURCE_USER" -f 'opencode' 2>/dev/null || true
+
+  share_one_item "$source_data" "opencode.db"
+  share_one_item "$source_data" "project"
+  share_one_item "$source_data" "storage"
+
+  rm -f "${source_data}/opencode.db-wal" "${source_data}/opencode.db-shm" 2>/dev/null || true
+
+  chgrp -R "$SHARED_GROUP" "$SHARED_DIR" 2>/dev/null || true
+  chmod -R g+rwX "$SHARED_DIR" 2>/dev/null || true
+  find "$SHARED_DIR" -type d -exec chmod g+s {} + 2>/dev/null || true
+}
+
+ensure_project_access() {
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:${SOURCE_USER}:x" "/home/${SOURCE_USER}" 2>/dev/null || true
+    setfacl -m "g:${SHARED_GROUP}:x" "/home/${SOURCE_USER}" 2>/dev/null || true
+    setfacl -R -m "g:${SHARED_GROUP}:rwX" "$PROJECT_DIR"
+    setfacl -R -m "d:g:${SHARED_GROUP}:rwX" "$PROJECT_DIR"
+  else
+    chmod o+x "/home/${SOURCE_USER}"
+    chgrp -R "$SHARED_GROUP" "$PROJECT_DIR"
+    chmod -R g+rwX "$PROJECT_DIR"
+    find "$PROJECT_DIR" -type d -exec chmod g+s {} +
+  fi
+}
+
+ensure_git_safe_directory() {
+  local username="$1"
+  local home project_real
+  home="$(managed_home "$username")"
+  project_real="$(realpath -m "$PROJECT_DIR")"
+
+  # The managed worker does not own repositories under SOURCE_USER's home.
+  # Modern Git rejects those repositories as "dubious ownership" unless the
+  # exact repository path is trusted. OpenCode relies on Git project identity
+  # to resolve project-scoped sessions, so this must happen before session
+  # discovery on every worker/project combination.
+  if [[ -d "$PROJECT_DIR/.git" ]] || git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! runuser -u "$username" -- env HOME="$home" \
+      git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$project_real"; then
+      runuser -u "$username" -- env HOME="$home" \
+        git config --global --add safe.directory "$project_real"
+      log "Registered Git safe.directory for $username: $project_real"
+    fi
+
+    runuser -u "$username" -- env HOME="$home" \
+      git -C "$project_real" rev-parse --show-toplevel >/dev/null 2>&1 || \
+      die "Managed worker $username cannot identify Git project: $project_real"
+  fi
+}
+
+next_worker_name() {
+  local n=0
+  if [[ -f "$SEQUENCE_FILE" ]]; then
+    read -r n < "$SEQUENCE_FILE" || n=0
+  fi
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$SEQUENCE_FILE"
+  printf '%s-%03d' "$MANAGED_PREFIX" "$n"
+}
+
+is_managed_user() {
+  local username="$1"
+  [[ "$username" =~ ^${MANAGED_PREFIX}-[0-9]{3,}$ ]]
+}
+
+archive_worker_metadata() {
+  local username="$1"
+  local reason="$2"
+  local exit_code="${3:-0}"
+  local file="${HISTORY_DIR}/${username}-$(date +%Y%m%d%H%M%S).env"
+
+  cat > "$file" <<META
+worker=${username}
+ended_at=$(date -Is)
+reason=${reason}
+exit_code=${exit_code}
+project=${PROJECT_DIR}
+META
+  chmod 600 "$file"
+}
+
+remove_worker() {
+  local username="$1"
+
+  is_managed_user "$username" || die "Refusing to remove unmanaged user: $username"
+  [[ "$username" != "$SOURCE_USER" ]] || die "Refusing to remove source user."
+
+  if getent passwd "$username" >/dev/null; then
+    pkill -KILL -u "$username" 2>/dev/null || true
+    crontab -r -u "$username" 2>/dev/null || true
+
+    local home
+    home="$(getent passwd "$username" | cut -d: -f6)"
+    userdel -r "$username" 2>/dev/null || userdel -f "$username" 2>/dev/null || true
+
+    if getent passwd "$username" >/dev/null; then
+      die "Could not remove worker account: $username"
+    fi
+
+    if [[ -n "$home" && "$home" == /home/${MANAGED_PREFIX}-* ]]; then
+      rm -rf "$home"
+    fi
+  fi
+}
+
+provision_worker() {
+  local username="$1"
+  local home data_dir
+
+  is_managed_user "$username" || die "Invalid managed username: $username"
+
+  home="$(managed_home "$username")"
+  data_dir="$(managed_data_dir "$username")"
+
+  if getent passwd "$username" >/dev/null; then
+    die "Worker already exists: $username"
+  fi
+
+  useradd --create-home --shell /bin/bash --groups "$SHARED_GROUP" "$username"
+
+  install -d -m 755 -o "$username" -g "$username" "$home/.opencode/bin"
+  install -m 755 -o "$username" -g "$username" "$CACHE_BIN" "$home/.opencode/bin/opencode"
+
+  install -d -m 700 -o "$username" -g "$username" "$home/.local"
+  install -d -m 700 -o "$username" -g "$username" "$home/.local/share"
+  install -d -m 700 -o "$username" -g "$username" "$data_dir"
+
+  ln -sfn "$SHARED_DIR/opencode.db" "$data_dir/opencode.db"
+  ln -sfn "$SHARED_DIR/project" "$data_dir/project"
+  ln -sfn "$SHARED_DIR/storage" "$data_dir/storage"
+
+  chown -h "$username:$username" \
+    "$data_dir/opencode.db" \
+    "$data_dir/project" \
+    "$data_dir/storage"
+
+  # Fresh isolated auth/config/state/cache.
+  rm -f "$data_dir/auth.json" "$data_dir/mcp-auth.json"
+  rm -rf "$home/.config/opencode" "$home/.local/state/opencode" "$home/.cache/opencode"
+
+  touch "$home/.bashrc"
+  chown "$username:$username" "$home/.bashrc"
+  if ! grep -Fq '.opencode/bin' "$home/.bashrc"; then
+    cat >> "$home/.bashrc" <<'BASHRC'
+
+# OpenCode
+export PATH="$HOME/.opencode/bin:$PATH"
+BASHRC
+  fi
+
+  printf '%s\n' "$username" > "$CURRENT_USER_FILE"
+  chmod 600 "$CURRENT_USER_FILE"
+
+  log "Provisioned worker $username"
+}
+
+current_worker() {
+  if [[ -f "$CURRENT_USER_FILE" ]]; then
+    local username=""
+    read -r username < "$CURRENT_USER_FILE" || true
+    if [[ -n "$username" ]] && getent passwd "$username" >/dev/null && is_managed_user "$username"; then
+      printf '%s' "$username"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+get_or_create_worker() {
+  local username=""
+  if username="$(current_worker)"; then
+    printf '%s' "$username"
+    return 0
+  fi
+
+  username="$(next_worker_name)"
+  provision_worker "$username"
+  printf '%s' "$username"
+}
+
+rotate_worker() {
+  local old_user="$1"
+  local reason="${2:-manual_rotation}"
+  local exit_code="${3:-0}"
+
+  archive_worker_metadata "$old_user" "$reason" "$exit_code"
+  remove_worker "$old_user"
+  rm -f "$CURRENT_USER_FILE"
+
+  local new_user
+  new_user="$(next_worker_name)"
+  provision_worker "$new_user"
+  printf '%s' "$new_user"
+}
+
+worker_log_file() {
+  printf '%s/%s.log' "$LOG_DIR" "$1"
+}
+
+detect_failure() {
+  local logfile="$1"
+  local exit_code="$2"
+
+  # Provider-independent patterns. Extend these in config/code for your provider.
+  if grep -Eqi \
+    'quota exceeded|usage limit reached|credit balance exhausted|insufficient quota|monthly limit reached|daily limit reached|you have reached.*limit' \
+    "$logfile"; then
+    printf 'QUOTA_EXHAUSTED'
+    return
+  fi
+
+  if grep -Eqi \
+    'authentication expired|token expired|invalid api key|unauthorized|authentication required|login required' \
+    "$logfile"; then
+    printf 'AUTH_EXPIRED'
+    return
+  fi
+
+  if grep -Eqi \
+    'rate limit|too many requests|http[^0-9]*429|status[^0-9]*429' \
+    "$logfile"; then
+    printf 'TEMP_RATE_LIMIT'
+    return
+  fi
+
+  if grep -Eqi \
+    'connection refused|connection reset|network.*unreachable|temporary failure|dns|timed out|timeout' \
+    "$logfile"; then
+    printf 'NETWORK_ERROR'
+    return
+  fi
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    printf 'SUCCESS'
+  else
+    printf 'UNKNOWN_ERROR'
+  fi
+}
+
+latest_session_for_project() {
+  local username="$1"
+  local home project_real json
+  home="$(managed_home "$username")"
+  project_real="$(realpath -m "$PROJECT_DIR")"
+
+  # Ask OpenCode for its own session catalog, then select the newest session
+  # whose authoritative stored directory exactly matches the current project.
+  json="$(runuser -u "$username" -- env     HOME="$home" USER="$username" LOGNAME="$username"     PATH="$home/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"     bash -lc "cd $(printf '%q' "$PROJECT_DIR") && opencode session list --format json"     2>/dev/null || true)"
+
+  [[ -n "$json" ]] || return 1
+
+  SESSION_JSON="$json" PROJECT_REAL="$project_real" python3 - <<'PY2'
+import json, os
+try:
+    rows=json.loads(os.environ.get("SESSION_JSON", "[]"))
+except Exception:
+    raise SystemExit(1)
+project=os.path.realpath(os.environ["PROJECT_REAL"])
+matching=[]
+for row in rows if isinstance(rows, list) else []:
+    d=row.get("directory")
+    sid=row.get("id")
+    if not d or not sid:
+        continue
+    if os.path.realpath(d)==project:
+        matching.append(row)
+if not matching:
+    raise SystemExit(1)
+matching.sort(key=lambda r: (r.get("updated") or 0, r.get("created") or 0), reverse=True)
+print(matching[0]["id"])
+PY2
+}
+
+run_worker_once() {
+  local username="$1"
+  local logfile="$2"
+  local home command session_id
+  home="$(managed_home "$username")"
+
+  command -v script >/dev/null 2>&1 || die "Required command 'script' was not found. Install util-linux."
+
+  : > "$logfile"
+  chown root:root "$logfile"
+  chmod 600 "$logfile"
+
+  session_id="$(latest_session_for_project "$username" || true)"
+
+  if [[ -n "$session_id" ]]; then
+    log "Resuming project session $session_id for $PROJECT_DIR"
+  else
+    log "No existing session for $PROJECT_DIR; starting a new OpenCode session"
+  fi
+
+  # Keep util-linux `script` attached to the caller's real terminal as root.
+  # Only the OpenCode child is demoted to the managed worker. This avoids
+  # losing the interactive TTY while still recording the full terminal stream.
+  printf -v command 'exec runuser -u %q -- env HOME=%q USER=%q LOGNAME=%q SHELL=/bin/bash PATH=%q bash -lc %q' \
+    "$username" \
+    "$home" \
+    "$username" \
+    "$username" \
+    "$home/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "cd $(printf '%q' "$PROJECT_DIR") && exec opencode${session_id:+ -s $(printf '%q' "$session_id")}${OPENCODE_EXTRA_ARGS:+ $OPENCODE_EXTRA_ARGS}" 
+
+  set +e
+  script -q -e -f -c "$command" "$logfile"
+  local exit_code=$?
+  set -e
+
+  return "$exit_code"
+}
+
+self_path() {
+  readlink -f "$0" 2>/dev/null || printf '%s' "$0"
+}
+
+installed_version() {
+  if [[ -x "$INSTALL_PATH" ]]; then
+    "$INSTALL_PATH" version 2>/dev/null || true
+  fi
+}
+
+install_self() {
+  local src
+  src="$(self_path)"
+
+  if [[ "$src" != "$INSTALL_PATH" ]]; then
+    install -m 755 -o root -g root "$src" "$INSTALL_PATH"
+    log "Installed OpenCode Manager $VERSION to $INSTALL_PATH"
+  else
+    chmod 755 "$INSTALL_PATH" 2>/dev/null || true
+  fi
+}
+
+cleanup_legacy_manager_files() {
+  # Remove only obsolete manager launchers/helpers. Never touch shared OpenCode data.
+  if [[ -e "$LEGACY_LAUNCHER" ]]; then
+    rm -f "$LEGACY_LAUNCHER"
+    log "Removed legacy launcher: $LEGACY_LAUNCHER"
+  fi
+
+  # Clean stale versioned manager binaries only from /usr/local/bin.
+  # Downloads/source copies are intentionally left alone.
+  find /usr/local/bin -maxdepth 1 -type f -name 'opencode-manager-v*' -delete 2>/dev/null || true
+}
+
+cmd_update() {
+  require_root
+  load_config
+  init_dirs
+  acquire_lock
+  validate_config
+
+  local old_version
+  old_version="$(installed_version)"
+  [[ -n "$old_version" ]] || old_version="not-installed"
+
+  log "Updating OpenCode Manager: ${old_version} -> ${VERSION}"
+
+  # Stop only disposable worker OpenCode processes; sessions are in shared storage.
+  local username=""
+  if username="$(current_worker)"; then
+    pkill -u "$username" -f 'opencode' 2>/dev/null || true
+  fi
+
+  install_self
+  cleanup_legacy_manager_files
+
+  # Preserve and reuse all manager state/shared data. Ensure required dirs still exist.
+  ensure_group
+  ensure_cached_binary
+
+  log "Update complete. Shared sessions/state were preserved."
+  printf '\nInstalled version: %s\n' "$VERSION"
+  printf 'Next:\n  cd /path/to/project\n  sudo opencode-manager doctor\n  sudo opencode-manager run\n'
+}
+
+cmd_install() {
+  require_root
+  load_config
+  init_dirs
+  acquire_lock
+  validate_config
+  ensure_group
+  ensure_cached_binary
+  ensure_shared_storage
+
+  log "Installation/initialization complete."
+  printf '\nRun:\n  sudo opencode-manager run\n'
+}
+
+cmd_run() {
+  OPENCODE_EXTRA_ARGS=""
+  if (( $# > 0 )); then
+    printf -v OPENCODE_EXTRA_ARGS ' %q' "$@"
+  fi
+  require_root
+  load_config
+  init_dirs
+  acquire_lock
+  validate_config
+  resolve_project_dir
+  ensure_group
+  ensure_cached_binary
+  ensure_project_access
+
+  # Shared-state migration is an installation concern. Never redo it for each run.
+  local source_data
+  source_data="$(source_data_dir)"
+  [[ -L "$source_data/opencode.db" ]] || die "Shared storage is not initialized correctly. Run: sudo opencode-manager install"
+  [[ -L "$source_data/project" ]] || die "Shared project storage is not initialized correctly. Run: sudo opencode-manager install"
+  [[ -L "$source_data/storage" ]] || die "Shared storage link is not initialized correctly. Run: sudo opencode-manager install"
+
+  local rotations=0
+  local network_retries=0
+
+  while true; do
+    local username logfile exit_code=0 result
+    username="$(get_or_create_worker)"
+    logfile="$(worker_log_file "$username")"
+
+    ensure_git_safe_directory "$username"
+    log "Starting OpenCode as $username in $PROJECT_DIR"
+
+    if run_worker_once "$username" "$logfile"; then
+      exit_code=0
+    else
+      exit_code=$?
+    fi
+
+    result="$(detect_failure "$logfile" "$exit_code")"
+    log "Worker $username stopped: result=$result exit_code=$exit_code"
+
+    case "$result" in
+      SUCCESS)
+        exit 0
+        ;;
+
+      TEMP_RATE_LIMIT)
+        log "Temporary rate limit detected. Retrying same worker after ${TEMP_RATE_LIMIT_SLEEP}s."
+        sleep "$TEMP_RATE_LIMIT_SLEEP"
+        continue
+        ;;
+
+      NETWORK_ERROR)
+        network_retries=$((network_retries + 1))
+        if (( network_retries > MAX_NETWORK_RETRIES )); then
+          die "Network retries exceeded (${MAX_NETWORK_RETRIES})."
+        fi
+        log "Network error detected. Retry ${network_retries}/${MAX_NETWORK_RETRIES} after ${NETWORK_RETRY_SLEEP}s."
+        sleep "$NETWORK_RETRY_SLEEP"
+        continue
+        ;;
+
+      AUTH_EXPIRED|QUOTA_EXHAUSTED)
+        network_retries=0
+
+        if [[ "$AUTO_ROTATE" != "1" ]]; then
+          die "$result detected and AUTO_ROTATE is disabled."
+        fi
+
+        rotations=$((rotations + 1))
+        if (( rotations > MAX_ROTATIONS_PER_RUN )); then
+          die "Rotation safety limit reached (${MAX_ROTATIONS_PER_RUN})."
+        fi
+
+        log "$result detected. Rotating managed worker."
+        rotate_worker "$username" "${result,,}" "$exit_code" >/dev/null
+
+        log "New worker created. Fresh authentication may be required before OpenCode can continue."
+        continue
+        ;;
+
+      UNKNOWN_ERROR)
+        die "Unknown OpenCode failure. Inspect: $logfile"
+        ;;
+    esac
+  done
+}
+
+cmd_rotate() {
+  require_root
+  load_config
+  init_dirs
+  acquire_lock
+  validate_config
+  resolve_project_dir
+  ensure_group
+  ensure_cached_binary
+  ensure_project_access
+
+  local source_data
+  source_data="$(source_data_dir)"
+  [[ -L "$source_data/opencode.db" && -L "$source_data/project" && -L "$source_data/storage" ]] || \
+    die "Shared storage is not initialized correctly. Run: sudo opencode-manager install"
+
+  local username=""
+  if username="$(current_worker)"; then
+    local new_user
+    new_user="$(rotate_worker "$username" "manual_rotation" 0)"
+    log "Rotated $username -> $new_user"
+  else
+    username="$(next_worker_name)"
+    provision_worker "$username"
+    log "Created initial worker: $username"
+  fi
+}
+
+cmd_stop() {
+  require_root
+  load_config
+  init_dirs
+  acquire_lock
+
+  local username=""
+  if username="$(current_worker)"; then
+    pkill -u "$username" -f 'opencode' 2>/dev/null || true
+    log "Stopped OpenCode processes for $username"
+  else
+    log "No active managed worker found."
+  fi
+}
+
+cmd_status() {
+  require_root
+  load_config
+  init_dirs
+  validate_config
+  resolve_project_dir
+
+  echo "OpenCode Manager $VERSION"
+  echo "Config:        $CONFIG_FILE"
+  echo "Source user:   $SOURCE_USER"
+  echo "Project:       $PROJECT_DIR"
+  echo "Shared dir:    $SHARED_DIR"
+  echo "Cached binary: $CACHE_BIN"
+
+  local username=""
+  if username="$(current_worker)"; then
+    echo "Current user:  $username"
+    if pgrep -u "$username" -f 'opencode' >/dev/null 2>&1; then
+      echo "Process:       running"
+    else
+      echo "Process:       stopped"
+    fi
+  else
+    echo "Current user:  none"
+    echo "Process:       stopped"
+  fi
+}
+
+check_pass() { printf '[PASS] %s\n' "$1"; }
+check_fail() { printf '[FAIL] %s\n' "$1"; return 1; }
+
+cmd_doctor() {
+  require_root
+  load_config
+  init_dirs
+  validate_config
+  resolve_project_dir
+
+  local failed=0 username=""
+
+  getent passwd "$SOURCE_USER" >/dev/null && check_pass "source user exists" || { check_fail "source user exists" || true; failed=1; }
+  [[ -d "$PROJECT_DIR" ]] && check_pass "project exists" || { check_fail "project exists" || true; failed=1; }
+  [[ -x "$CACHE_BIN" ]] && check_pass "cached OpenCode binary exists" || { check_fail "cached OpenCode binary exists" || true; failed=1; }
+  getent group "$SHARED_GROUP" >/dev/null && check_pass "shared group exists" || { check_fail "shared group exists" || true; failed=1; }
+  [[ -d "$SHARED_DIR" ]] && check_pass "shared directory exists" || { check_fail "shared directory exists" || true; failed=1; }
+  command -v script >/dev/null 2>&1 && check_pass "pseudo-terminal launcher (script) exists" || { check_fail "pseudo-terminal launcher (script) exists" || true; failed=1; }
+
+  local source_data
+  source_data="$(source_data_dir)"
+  [[ -L "$source_data/opencode.db" ]] && check_pass "source DB is shared" || { check_fail "source DB is shared" || true; failed=1; }
+  [[ -L "$source_data/project" ]] && check_pass "source project storage is shared" || { check_fail "source project storage is shared" || true; failed=1; }
+  [[ -L "$source_data/storage" ]] && check_pass "source storage is shared" || { check_fail "source storage is shared" || true; failed=1; }
+
+  if username="$(current_worker)"; then
+    local home data_dir
+    home="$(managed_home "$username")"
+    data_dir="$(managed_data_dir "$username")"
+
+    check_pass "managed worker exists: $username"
+    [[ -x "$home/.opencode/bin/opencode" ]] && check_pass "worker binary exists" || { check_fail "worker binary exists" || true; failed=1; }
+    [[ -L "$data_dir/opencode.db" ]] && check_pass "worker DB is shared" || { check_fail "worker DB is shared" || true; failed=1; }
+    [[ ! -e "$data_dir/auth.json" ]] && check_pass "worker auth.json is isolated/empty" || { check_fail "worker auth.json unexpectedly exists" || true; failed=1; }
+    [[ ! -e "$data_dir/mcp-auth.json" ]] && check_pass "worker mcp-auth.json is isolated/empty" || { check_fail "worker mcp-auth.json unexpectedly exists" || true; failed=1; }
+
+    local doctor_logfile
+    doctor_logfile="$(worker_log_file "$username")"
+    touch "$doctor_logfile"
+    chown "$username:$username" "$doctor_logfile"
+    chmod 600 "$doctor_logfile"
+    if test -w "$doctor_logfile"; then
+      check_pass "manager can create worker log file"
+    else
+      check_fail "manager can create worker log file" || true
+      failed=1
+    fi
+
+    if runuser -u "$username" -- test -r "$PROJECT_DIR"; then
+      check_pass "worker can read project"
+    else
+      check_fail "worker can read project" || true
+      failed=1
+    fi
+
+    if [[ -d "$PROJECT_DIR/.git" ]] || git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      if ensure_git_safe_directory "$username" >/dev/null 2>&1 && \
+         runuser -u "$username" -- env HOME="$home" git -C "$PROJECT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+        check_pass "worker recognizes Git project (safe.directory)"
+      else
+        check_fail "worker recognizes Git project (safe.directory)" || true
+        failed=1
+      fi
+    fi
+
+    if runuser -u "$username" -- env HOME="$home" PATH="$home/.opencode/bin:/usr/bin:/bin" opencode --version >/dev/null 2>&1; then
+      check_pass "worker can execute OpenCode"
+    else
+      check_fail "worker can execute OpenCode" || true
+      failed=1
+    fi
+  else
+    printf '[INFO] no managed worker exists yet; run: sudo opencode-manager run\n'
+  fi
+
+  if (( failed == 0 )); then
+    echo "Result: HEALTHY"
+  else
+    echo "Result: FAILED"
+    exit 1
+  fi
+}
+
+cmd_logs() {
+  require_root
+  load_config
+  init_dirs
+
+  if [[ -f "$MANAGER_LOG" ]]; then
+    tail -n 200 "$MANAGER_LOG"
+  fi
+
+  local username=""
+  if username="$(current_worker)"; then
+    local logfile
+    logfile="$(worker_log_file "$username")"
+    if [[ -f "$logfile" ]]; then
+      echo
+      echo "--- $logfile ---"
+      tail -n 200 "$logfile"
+    fi
+  fi
+}
+
+usage() {
+  cat <<USAGE
+OpenCode Manager $VERSION
+
+Usage:
+  sudo ./opencode-manager-v1.2.0 install
+  sudo ./opencode-manager-v1.2.0 update
+  sudo opencode-manager run [opencode-args...]
+  sudo opencode-manager status
+  sudo opencode-manager rotate
+  sudo opencode-manager stop
+  sudo opencode-manager doctor
+  sudo opencode-manager logs
+  opencode-manager version
+
+Main command:
+  cd /path/to/project
+  sudo opencode-manager run
+
+Examples:
+  cd /path/to/project
+  sudo opencode-manager run
+
+Update from a downloaded new version:
+  chmod +x ./opencode-manager-v1.2.0
+  sudo ./opencode-manager-v1.2.0 update
+
+Notes:
+  - The current working directory is the project. No PROJECT_DIR config is needed.
+  - If that directory already has sessions, the newest matching session is resumed automatically.
+  - If it has no session, OpenCode starts a new session there.
+  - Session/history storage is shared.
+  - Provider auth/config/cache/state remain isolated per managed worker.
+  - Automatic rotation only changes the disposable Linux worker.
+  - SOURCE_USER is permanent and is never deleted by the manager.
+  - OpenCode 1.18.32 exposes provider management through `opencode providers` / `opencode auth`; there is no `--switch-account` flag.
+USAGE
+}
+
+main() {
+  local command="${1:-help}"
+
+  case "$command" in
+    install) cmd_install ;;
+    update) cmd_update ;;
+    run) shift; cmd_run "$@" ;;
+    rotate) cmd_rotate ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    doctor) cmd_doctor ;;
+    logs) cmd_logs ;;
+    version|--version|-v) echo "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
