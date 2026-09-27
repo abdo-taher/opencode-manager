@@ -12,7 +12,7 @@ set -Eeuo pipefail
 #   with credentials/accounts you are authorized to use.
 # ============================================================
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 CONFIG_FILE="${OPENCODE_MANAGER_CONFIG:-/etc/opencode-manager/config.env}"
 STATE_DIR="${STATE_DIR:-/opt/opencode-manager/state}"
