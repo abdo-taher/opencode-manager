@@ -4,7 +4,7 @@ OpenCode Manager is a Linux/Ubuntu wrapper around OpenCode that runs OpenCode th
 
 The permanent project owner stays untouched. OpenCode workers can be replaced, while the project directory and OpenCode session history remain available through shared OpenCode storage.
 
-Current package version: **v1.2.2**.
+Current package version: **v1.2.3**.
 
 Repository: `https://github.com/abdo-taher/opencode-manager`
 
@@ -82,16 +82,16 @@ Verify it before installation:
 Download both package artifacts from the GitHub Releases page, or use `gh`:
 
 ```bash
-gh release download v1.2.2 \
+gh release download v1.2.3 \
   --repo abdo-taher/opencode-manager \
-  --pattern 'opencode-manager-package-v1.2.2.zip'
+  --pattern 'opencode-manager-package-v1.2.3.zip'
 ```
 
 Extract and install:
 
 ```bash
-unzip opencode-manager-package-v1.2.2.zip
-cd opencode-manager-package-v1.2.2
+unzip opencode-manager-package-v1.2.3.zip
+cd opencode-manager-package-v1.2.3
 sudo ./scripts/install-dependencies-ubuntu.sh
 ./scripts/check-dependencies.sh
 sudo ./install.sh
@@ -106,7 +106,7 @@ opencode-manager version
 Expected:
 
 ```text
-1.2.2
+1.2.3
 ```
 
 ## Install from source
@@ -267,8 +267,8 @@ opencode-manager version
 When installing a newer release package:
 
 ```bash
-unzip opencode-manager-package-v1.2.2.zip
-cd opencode-manager-package-v1.2.2
+unzip opencode-manager-package-v1.2.3.zip
+cd opencode-manager-package-v1.2.3
 sudo ./update.sh
 ```
 
@@ -373,11 +373,11 @@ Artifacts are created under:
 dist/
 ```
 
-For v1.2.2:
+For v1.2.3:
 
 ```text
-dist/opencode-manager-package-v1.2.2.zip
-dist/opencode-manager-package-v1.2.2.tar.gz
+dist/opencode-manager-package-v1.2.3.zip
+dist/opencode-manager-package-v1.2.3.tar.gz
 ```
 
 The build script also refreshes `SHA256SUMS` before packaging.
@@ -400,12 +400,12 @@ cd ~/Downloads/opencode-manager
 ./scripts/build-release.sh
 
 git add .
-git commit -m "Release v1.2.2"
+git commit -m "Release v1.2.3"
 
-git tag -a v1.2.2 -m "OpenCode Manager v1.2.2"
+git tag -a v1.2.3 -m "OpenCode Manager v1.2.3"
 
 git push origin main
-git push origin v1.2.2
+git push origin v1.2.3
 
 ./scripts/publish-github-release.sh
 ```
@@ -416,24 +416,24 @@ The publisher checks that the release artifacts exist before calling `gh release
 
 Do not leave a release tag pointing at the wrong commit.
 
-For example, if `v1.2.2` was accidentally created on the previous release:
+For example, if `v1.2.3` was accidentally created on the previous release:
 
 ```bash
-git tag -d v1.2.2
-git push origin :refs/tags/v1.2.2
+git tag -d v1.2.3
+git push origin :refs/tags/v1.2.3
 ```
 
 Make the real release commit, then recreate and push the tag:
 
 ```bash
-git tag -a v1.2.2 -m "OpenCode Manager v1.2.2"
-git push origin v1.2.2
+git tag -a v1.2.3 -m "OpenCode Manager v1.2.3"
+git push origin v1.2.3
 ```
 
 ## Verifying a GitHub release
 
 ```bash
-gh release view v1.2.2 --repo abdo-taher/opencode-manager
+gh release view v1.2.3 --repo abdo-taher/opencode-manager
 ```
 
 List releases:
@@ -445,11 +445,11 @@ gh release list --repo abdo-taher/opencode-manager
 Download and verify later:
 
 ```bash
-gh release download v1.2.2 \
+gh release download v1.2.3 \
   --repo abdo-taher/opencode-manager \
-  --pattern 'opencode-manager-package-v1.2.2.zip'
+  --pattern 'opencode-manager-package-v1.2.3.zip'
 
-sha256sum opencode-manager-package-v1.2.2.zip
+sha256sum opencode-manager-package-v1.2.3.zip
 ```
 
 ## Security and safety
